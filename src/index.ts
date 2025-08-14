@@ -1,30 +1,33 @@
-import { Api, sessions, TelegramClient } from "teleproto";
+import {Api, sessions, TelegramClient} from "teleproto";
 import delay from "delay";
 import BigInteger from "big-integer";
-import { Telegraf } from "telegraf";
+import {Telegraf} from "telegraf";
 
-import { env } from "./env.js";
-import { ask } from "./helpers.js";
+import {env} from "./env.js";
+import {ask} from "./helpers.js";
 
 import GetPaymentForm = Api.payments.GetPaymentForm;
 import SendStarsForm = Api.payments.SendStarsForm;
+import UpgradeStarGift = Api.payments.UpgradeStarGift;
+import GetSavedStarGifts = Api.payments.GetSavedStarGifts;
 import Channel = Api.Channel;
 import InputPeerSelf = Api.InputPeerSelf;
 import GetStarGifts = Api.payments.GetStarGifts;
+import {asyncWrapProviders} from "async_hooks";
 
 const storeSession = new sessions.StoreSession("session_folder");
 const client = new TelegramClient(storeSession, Number(env.API_ID), env.API_HASH, {
-  connectionRetries: 5,
+    connectionRetries: 5,
 });
 
 await client.start({
-  phoneNumber: async () => ask("Введите номер телефона:"),
-  password: async () => ask("Введите пароль:"),
-  phoneCode: async () => ask("Введите код телеграмм:"),
-  onError: (err) => {
-    console.error("Telegram error:", err);
-    process.exit(0);
-  },
+    phoneNumber: async () => ask("Введите номер телефона:"),
+    password: async () => ask("Введите пароль:"),
+    phoneCode: async () => ask("Введите код телеграмм:"),
+    onError: (err) => {
+        console.error("Telegram error:", err);
+        process.exit(0);
+    },
 });
 
 const telegraf = new Telegraf(env.BOT_TOKEN);
@@ -34,122 +37,264 @@ const myId = me.id.toString();
 let lastMessageId: null | number = null;
 
 let isBotStopped = false;
+let isBotUpdateStopped = false;
 
 await telegraf.telegram.setMyCommands([
-  {
-    command: "stopbuys",
-    description: "Остановить бота",
-  },
-  {
-    command: "startbuys",
-    description: "Запустить бота",
-  },
+    {
+        command: "stopbuys",
+        description: "Остановить бота",
+    },
+    {
+        command: "startbuys",
+        description: "Запустить бота",
+    },
+    {
+        command: "stopupdate",
+        description: "Остановить обновление",
+    },
+    {
+        command: "startupdate",
+        description: "Запустить обновление",
+    },
 ]);
 
 telegraf.command("stopbuys", (ctx) => {
-  isBotStopped = true;
-  lastMessageId = null;
-  ctx.reply("бот остановлен");
+    isBotStopped = true;
+    lastMessageId = null;
+    ctx.reply("бот остановлен");
 });
 
 telegraf.command("startbuys", (ctx) => {
-  isBotStopped = false;
-  ctx.reply("бот запущен");
+    isBotStopped = false;
+    ctx.reply("бот запущен");
+});
+
+telegraf.command("stopupdate", (ctx) => {
+    isBotUpdateStopped = true;
+    // lastMessageId = null;
+    ctx.reply("бот остановлен");
+});
+
+telegraf.command("startupdate", (ctx) => {
+    isBotUpdateStopped = false;
+    ctx.reply("бот запущен");
+});
+
+telegraf.command("setlastchannel", async (ctx) => {
+    const args = ctx.message.text.split(" ").slice(1);
+    if (args.length === 0) {
+        return ctx.reply("❌ Укажи тег (@channelname) или ID канала после команды");
+    }
+
+    const input = args[0];
+    try {
+        if (input.startsWith("@")) {
+            // По username
+            const resolved = await client.invoke(
+                new Api.contacts.ResolveUsername({ username: input.slice(1) })
+            );
+            if (!resolved.chats || resolved.chats.length === 0) {
+                return ctx.reply("❌ Канал с таким username не найден");
+            }
+            lastCreatedChannel = resolved.chats[0] as Channel;
+        } else {
+            // По числовому ID
+            const channelId = BigInteger(input); // конвертация в long
+            const hash = BigInteger(0)
+            const channels = (await client.invoke(
+                new Api.channels.GetChannels({
+                    id: [new Api.InputChannel({ channelId: channelId, accessHash: hash })]
+                })
+            )) as Api.messages.Chats;
+
+            if (!channels.chats || channels.chats.length === 0) {
+                return ctx.reply("❌ Канал с таким ID не найден");
+            }
+            lastCreatedChannel = channels.chats[0] as Channel;
+        }
+
+        ctx.reply(`✅ Последний канал установлен: ${lastCreatedChannel.title}`);
+    } catch (err) {
+        console.error("Ошибка при установке канала:", err);
+        ctx.reply("❌ Ошибка при установке канала. Проверь данные.");
+    }
 });
 
 telegraf.launch();
 
 let cycleCount = 1;
+let lastCreatedChannel: Channel | null = null;
 
 while (true) {
-  cycleCount++;
-  if (isBotStopped) {
-    await delay(1000);
-  } else {
-    try {
-      if (!lastMessageId) {
-        const message = await telegraf.telegram.sendMessage(
-          me.id.toString(),
-          `Бот исправен, последнее обновление: ${new Date().toLocaleString()}(UTC+0)`,
-        );
-        lastMessageId = message.message_id;
-      } else if (cycleCount % 50 === 0) {
-        await telegraf.telegram.editMessageText(
-          me.id.toString(),
-          lastMessageId,
-          undefined,
-          `Бот исправен, последнее обновление: ${new Date().toLocaleString()}(UTC+0)`,
-        );
-      }
-    } catch (err) {
-      console.log("Ошибка отправки сообщения в тг бота", err);
+    cycleCount++;
+    // === АВТОАПГРЕЙД ПОДАРКОВ ===
+    if (!isBotUpdateStopped) {
+        await delay(1000); // небольшая пауза, чтобы подарки появились в канале
+
+        try {
+            if (lastCreatedChannel) {
+                const savedGifts = (await client.invoke(new GetSavedStarGifts({
+                    peer: new Api.InputPeerChannel({
+                        channelId: lastCreatedChannel.id,
+                        accessHash: lastCreatedChannel.accessHash!,
+                    })
+                }))) as Api.payments.SavedStarGifts;
+
+                const giftsToUpgrade = savedGifts.gifts.filter(g => g.canUpgrade);
+
+                if (giftsToUpgrade.length > 0) {
+                    await telegraf.telegram.sendMessage(
+                        myId,
+                        `Найдено ${giftsToUpgrade.length} подарков для апгрейда.`,
+                    );
+                }
+
+                for (const gift of giftsToUpgrade) {
+                    const inputGift = new Api.InputSavedStarGiftChat({
+                        peer: (new Api.InputPeerChannel({
+                            channelId: lastCreatedChannel.id!,
+                            accessHash: lastCreatedChannel.accessHash!,
+                        }))!,
+                        savedId: gift.savedId!
+                    });
+                    // {
+                    //     peer: new Api.InputPeerChannel({
+                    //         channelId: lastCreatedChannel.id,
+                    //         accessHash: lastCreatedChannel.accessHash!
+                    //     }),
+                    //     savedId: gift.savedId
+                    // }
+
+                    // (опционально) превью апгрейда
+                    const preview = await client.invoke(new Api.payments.GetStarGiftUpgradePreview({
+                        giftId: gift.gift.id
+                    }));
+                    console.log("Превью апгрейда:", preview.sampleAttributes);
+
+                    if (gift.upgradeStars && gift.upgradeStars.toJSNumber() > 0) {
+                        // Платный апгрейд
+                        const upgradeInvoice = new Api.InputInvoiceStarGiftUpgrade({
+                            stargift: inputGift,
+                            keepOriginalDetails: true
+                        });
+                        const upgradePaymentForm = await client.invoke(new GetPaymentForm({invoice: upgradeInvoice}));
+                        await client.invoke(new SendStarsForm({
+                            invoice: upgradeInvoice,
+                            formId: upgradePaymentForm.formId
+                        }));
+
+                        await telegraf.telegram.sendMessage(
+                            myId,
+                            `✅ Оплачен и выполнен апгрейд подарка ${gift.gift.id}`,
+                        );
+                    } else {
+                        // Бесплатный апгрейд
+                        await client.invoke(new Api.payments.UpgradeStarGift({
+                            stargift: inputGift,
+                            keepOriginalDetails: true
+                        }));
+
+                        await telegraf.telegram.sendMessage(
+                            myId,
+                            `✅ Бесплатный апгрейд подарка ${gift.gift.id}`,
+                        );
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Ошибка апгрейда подарков:", err);
+            await telegraf.telegram.sendMessage(myId, `❌ Ошибка апгрейда подарков`);
+        }
     }
 
-    const starGifts = (await client.invoke(new GetStarGifts({ hash: 0 }))) as Api.payments.StarGifts;
+    if (isBotStopped) {
+        await delay(1000);
+    } else {
+        try {
+            if (!lastMessageId) {
+                const message = await telegraf.telegram.sendMessage(
+                    me.id.toString(),
+                    `Бот исправен, последнее обновление: ${new Date().toLocaleString()}(UTC+0)`,
+                );
+                lastMessageId = message.message_id;
+            } else if (cycleCount % 50 === 0) {
+                await telegraf.telegram.editMessageText(
+                    me.id.toString(),
+                    lastMessageId,
+                    undefined,
+                    `Бот исправен, последнее обновление: ${new Date().toLocaleString()}(UTC+0)`,
+                );
+            }
+        } catch (err) {
+            console.log("Ошибка отправки сообщения в тг бота", err);
+        }
 
-    const gifts = starGifts.gifts.filter((gift) => gift.className === "StarGift");
-    const limitedGifts = gifts.filter((gift) => gift.limited);
-    const availableLimitedGifts = limitedGifts.filter((gift) => !gift.soldOut);
+        const starGifts = (await client.invoke(new GetStarGifts({hash: 0}))) as Api.payments.StarGifts;
 
-    const starsStatus = await client.invoke(new Api.payments.GetStarsStatus({ peer: new InputPeerSelf() }));
-    const balance = starsStatus.balance.amount.toJSNumber();
+        const gifts = starGifts.gifts.filter((gift) => gift.className === "StarGift");
+        const limitedGifts = gifts.filter((gift) => gift.limited);
+        const availableLimitedGifts = limitedGifts.filter((gift) => !gift.soldOut);
 
-    if (availableLimitedGifts.length === 0) {
-      await delay(1000);
-      continue;
-    }
+        const starsStatus = await client.invoke(new Api.payments.GetStarsStatus({peer: new InputPeerSelf()}));
+        const balance = starsStatus.balance.amount.toJSNumber();
 
-    const giftsSortedBySupply = availableLimitedGifts.sort((a, b) => a.availabilityTotal! - b.availabilityTotal!);
+        if (availableLimitedGifts.length === 0) {
+            await delay(1000);
+            continue;
+        }
 
-    const giftToBuy = giftsSortedBySupply.find((gift) => {
-      const giftPrice = gift.stars.toJSNumber();
-      if (balance < giftPrice) {
-        return false;
-      }
-      if (gift.limitedPerUser) {
-        return !!gift.perUserRemains;
-      }
-      return true;
-    });
+        const giftsSortedBySupply = availableLimitedGifts.sort((a, b) => a.availabilityTotal! - b.availabilityTotal!);
 
-    if (!giftToBuy) {
-      continue;
-    }
-
-    try {
-      let giftsToSend = giftToBuy.availabilityTotal! <= 30000 ? 3 : 10;
-      const updates = (await client.invoke(
-        new Api.channels.CreateChannel({
-          title: `@giftsatellite autobuy`,
-          about: `Supply = ${giftToBuy.availabilityTotal}`,
-        }),
-      )) as Api.Updates;
-
-      const channel = updates.chats[0] as Channel;
-
-      await telegraf.telegram.sendMessage(
-        myId,
-        `Создан канал, отгружаем на него ${giftsToSend} подарков с id ${giftToBuy.id}.`,
-      );
-
-      while (giftsToSend > 0) {
-        const invoice = new Api.InputInvoiceStarGift({
-          peer: new Api.InputPeerChannel({
-            channelId: channel.id,
-            accessHash: channel.accessHash!,
-          }),
-          giftId: BigInteger(giftToBuy.id),
-          hideName: true,
+        const giftToBuy = giftsSortedBySupply.find((gift) => {
+            const giftPrice = gift.stars.toJSNumber();
+            if (balance < giftPrice) {
+                return false;
+            }
+            if (gift.limitedPerUser) {
+                return !!gift.perUserRemains;
+            }
+            return true;
         });
 
-        const paymentForm = await client.invoke(new GetPaymentForm({ invoice }));
-        await client.invoke(new SendStarsForm({ invoice, formId: paymentForm.formId }));
-        giftsToSend--;
-      }
-    } catch (error) {
-      lastMessageId = null;
-      await telegraf.telegram.sendMessage(myId, `Ошибка в slave-боте!`);
-      await delay(1500);
+        if (!giftToBuy) {
+            continue;
+        }
+
+        try {
+            let giftsToSend = giftToBuy.availabilityTotal! <= 30000 ? 3 : 10;
+            const updates = (await client.invoke(
+                new Api.channels.CreateChannel({
+                    title: `@giftsatellite autobuy`,
+                    about: `Supply = ${giftToBuy.availabilityTotal}`,
+                }),
+            )) as Api.Updates;
+
+            const channel = updates.chats[0] as Channel;
+            lastCreatedChannel = channel;
+
+            await telegraf.telegram.sendMessage(
+                myId,
+                `Создан канал, отгружаем на него ${giftsToSend} подарков с id ${giftToBuy.id}.`,
+            );
+
+            while (giftsToSend > 0) {
+                const invoice = new Api.InputInvoiceStarGift({
+                    peer: new Api.InputPeerChannel({
+                        channelId: channel.id,
+                        accessHash: channel.accessHash!,
+                    }),
+                    giftId: BigInteger(giftToBuy.id),
+                    hideName: true,
+                });
+
+                const paymentForm = await client.invoke(new GetPaymentForm({invoice}));
+                await client.invoke(new SendStarsForm({invoice, formId: paymentForm.formId}));
+                giftsToSend--;
+            }
+        } catch (error) {
+            lastMessageId = null;
+            await telegraf.telegram.sendMessage(myId, `Ошибка в slave-боте!`);
+            await delay(1500);
+        }
     }
-  }
 }
