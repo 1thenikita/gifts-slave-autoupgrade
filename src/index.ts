@@ -133,12 +133,17 @@ while (true) {
 
         try {
             if (lastCreatedChannel) {
-                const savedGifts = (await client.invoke(new GetSavedStarGifts({
+                var req = new GetSavedStarGifts({
+                    // excludeLimited: true,
+                    // excludeUnique: false,
+                    // excludeUnlimited: false,
                     peer: new Api.InputPeerChannel({
                         channelId: lastCreatedChannel.id,
-                        accessHash: lastCreatedChannel.accessHash!,
-                    })
-                }))) as Api.payments.SavedStarGifts;
+                        accessHash: lastCreatedChannel.accessHash!
+                    }),
+                    limit: 100, offset: ""
+                });
+                const savedGifts = (await client.invoke(req));
 
                 const giftsToUpgrade = savedGifts.gifts.filter(g => g.canUpgrade);
 
@@ -204,6 +209,7 @@ while (true) {
         } catch (err) {
             console.error("Ошибка апгрейда подарков:", err);
             await telegraf.telegram.sendMessage(myId, `❌ Ошибка апгрейда подарков`);
+            await telegraf.telegram.sendMessage(myId, err);
         }
     }
 
