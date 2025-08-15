@@ -103,7 +103,7 @@ telegraf.command("setlastchannel", async (ctx) => {
             const hash = BigInteger(0)
             const channels = (await client.invoke(
                 new Api.channels.GetChannels({
-                    id: [new Api.InputChannel({ channelId: channelId, accessHash: hash })]
+                    id: [channelId]
                 })
             )) as Api.messages.Chats;
 
